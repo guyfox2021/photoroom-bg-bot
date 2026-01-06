@@ -8,15 +8,20 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          request_pty: true
-          debug: true
-          script: |
+      - name: Write SSH key
+        shell: bash
+        run: |
+          set -e
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY_B64 }}" | base64 -d > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keygen -lf ~/.ssh/deploy_key
+
+      - name: Deploy via SSH (native)
+        shell: bash
+        run: |
+          set -e
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
             set -e
             cd ${{ secrets.APP_DIR }}
             git fetch --all
@@ -25,3 +30,4 @@ jobs:
             pip install -r requirements.txt
             systemctl restart fonoff-bot
             systemctl --no-pager status fonoff-bot
+          "
