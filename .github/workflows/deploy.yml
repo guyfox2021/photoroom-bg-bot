@@ -2,7 +2,7 @@ name: Deploy to VPS
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
   deploy:
@@ -11,23 +11,38 @@ jobs:
       - name: Write SSH key
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_KEY_B64 }}" | base64 -d > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keygen -lf ~/.ssh/deploy_key
 
-      - name: Deploy via SSH (native)
+      - name: SSH connectivity test
         shell: bash
         run: |
-          set -e
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "
-            set -e
-            cd ${{ secrets.APP_DIR }}
-            git fetch --all
-            git reset --hard origin/main
-            . .venv/bin/activate
-            pip install -r requirements.txt
-            systemctl restart fonoff-bot
-            systemctl --no-pager status fonoff-bot
-          "
+          set -euo pipefail
+          TARGET="${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}"
+          echo "Connecting to: $TARGET"
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            -o IdentitiesOnly=yes \
+            "$TARGET" "whoami && hostname && pwd"
+
+      - name: Deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}"
+          echo "Deploy to: $TARGET"
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            -o IdentitiesOnly=yes \
+            "$TARGET" \
+            "set -e
+             cd ${{ secrets.APP_DIR }}
+             git fetch --all
+             git reset --hard origin/main
+             . .venv/bin/activate
+             pip install -r requirements.txt
+             systemctl restart fonoff-bot
+             systemctl --no-pager status fonoff-bot"
