@@ -17,11 +17,25 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keygen -lf ~/.ssh/deploy_key
 
+      - name: Debug secrets formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          u='${{ secrets.SSH_USER }}'
+          h='${{ secrets.SSH_HOST }}'
+          echo "len(user)=$(printf %s "$u" | wc -c)"
+          echo "len(host)=$(printf %s "$h" | wc -c)"
+          echo "user hex:"
+          printf %s "$u" | od -An -tx1
+          echo "host hex:"
+          printf %s "$h" | od -An -tx1
+    
+
       - name: SSH connectivity test
         shell: bash
         run: |
           set -euo pipefail
-          TARGET="${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}"
+          TARGET="$(echo -n '${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}' | tr -d '\r\n' | xargs)"
           echo "Connecting to: $TARGET"
           ssh -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
@@ -32,7 +46,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TARGET="${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}"
+          TARGET="$(echo -n '${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}' | tr -d '\r\n' | xargs)"
           echo "Deploy to: $TARGET"
           ssh -i ~/.ssh/deploy_key \
             -o StrictHostKeyChecking=no \
