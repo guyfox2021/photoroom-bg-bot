@@ -88,7 +88,7 @@ async def process_photo(bot: Bot, chat_id: int, user_id: int, image_bytes: bytes
         reply_markup=kb_main(),
     )
 
-    await db.inc_used_this_month(user_id, 1)
+    await db.inc_used_this_month(user_id)
     await db.log_event("remove_bg_success", user_id=user_id)
 
 
