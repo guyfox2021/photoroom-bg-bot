@@ -1,13 +1,13 @@
 import asyncio
+from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
     Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    BufferedInputFile,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
 )
 from aiogram.enums import ContentType
 
@@ -15,270 +15,394 @@ from bot.config import BOT_TOKEN, PHOTOROOM_API_KEY, ADMIN_ID
 from bot.photoroom import remove_bg
 from bot.db import DB
 
-dp = Dispatcher()
-
-# ===== НАСТРОЙКИ =====
-CHANNEL_USERNAME = "@resident_room"
+# =======================
+# CONFIG
+# =======================
+CHANNEL_ID = -1003173585559
 CHANNEL_URL = "https://t.me/resident_room"
 
-FREE_USES = 1
-SUB_USES = 1
-MAX_USES_PER_MONTH = 50
+# Usage rules per month:
+# 0 used -> free
+# 1 used -> requires subscription
+# 2+ used -> show tariffs
 
-DB_PATH = "bot.db"
-# =====================
-
-db = DB(DB_PATH)
-
-
-def free_limit() -> int:
-    return FREE_USES + SUB_USES
+db = DB()
+dp = Dispatcher()
 
 
+# =======================
+# Keyboards (bottom buttons)
+# =======================
+def rk_main(is_admin: bool) -> ReplyKeyboardMarkup:
+    rows = [[KeyboardButton(text="🪄 Убрать фон"), KeyboardButton(text="💳 Тарифы")]]
+    if is_admin:
+        rows.append([KeyboardButton(text="📊 Статистика")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def rk_back(is_admin: bool) -> ReplyKeyboardMarkup:
+    # keep admin button available for admin even on sub-screens
+    rows = [[KeyboardButton(text="⬅️ Назад")]]
+    if is_admin:
+        rows.append([KeyboardButton(text="📊 Статистика")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def rk_subscribe(is_admin: bool) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="✅ Я подписался")],
+        [KeyboardButton(text="⬅️ Назад")],
+    ]
+    if is_admin:
+        rows.append([KeyboardButton(text="📊 Статистика")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def rk_admin() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📊 Сегодня"), KeyboardButton(text="📈 7 дней")],
+            [KeyboardButton(text="🎯 Конверсия"), KeyboardButton(text="💳 Тарифы (таблица)")],
+            [KeyboardButton(text="⬅️ Назад")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+# =======================
+# Helpers
+# =======================
 def is_admin(user_id: int) -> bool:
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
+    return int(user_id) == int(ADMIN_ID)
 
 
 async def is_subscribed(bot: Bot, user_id: int) -> bool:
     try:
-        member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        return member.status in ("member", "administrator", "creator")
-    except Exception:
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return member.status in ("member", "administrator", "creator", "restricted")
+    except Exception as e:
+        # Distinguish "not subscribed" from errors
+        try:
+            await db.log_event(user_id=user_id, event="check_sub_error", meta=str(e)[:300])
+        except Exception:
+            pass
         return False
 
 
-def kb_main() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🪄 Убрать фон", callback_data="remove_bg")],
-            [InlineKeyboardButton(text="💳 Тарифы", callback_data="tariffs")],
-        ]
-    )
-
-
-def kb_subscribe() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_URL)],
-            [InlineKeyboardButton(text="✅ Я подписался — проверить", callback_data="check_sub")],
-            [InlineKeyboardButton(text="💳 Тарифы", callback_data="tariffs")],
-        ]
-    )
-
-
-def kb_admin() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📅 Сегодня", callback_data="adm_today")],
-            [InlineKeyboardButton(text="📈 7 дней", callback_data="adm_7d")],
-            [InlineKeyboardButton(text="🔁 Конверсия", callback_data="adm_funnel_7d")],
-            [InlineKeyboardButton(text="🧾 Таблица тарифов", callback_data="adm_plans")],
-        ]
-    )
-
-
-async def process_photo(bot: Bot, chat_id: int, user_id: int, image_bytes: bytes):
-    result = await remove_bg(image_bytes=image_bytes, api_key=PHOTOROOM_API_KEY)
-    png = BufferedInputFile(result, filename="no_bg.png")
-
-    await bot.send_document(
-        chat_id,
-        png,
-        caption="✅ Готово! Фото без фона.",
-        reply_markup=kb_main(),
-    )
-
-    await db.inc_used_this_month(user_id)
-    await db.log_event("remove_bg_success", user_id=user_id)
-
-
-@dp.message(CommandStart())
-async def start(m: Message):
-    await db.touch_user(m.from_user.id)
-    await db.log_event("start", user_id=m.from_user.id)
-    await m.answer("Отправь фото — я уберу фон и пришлю результат 👇", reply_markup=kb_main())
-
-
-@dp.callback_query(F.data == "remove_bg")
-async def cb_remove_bg(c: CallbackQuery):
-    await db.touch_user(c.from_user.id)
-    await db.log_event("click_remove_bg", user_id=c.from_user.id)
-    await c.answer()
-    await c.message.answer("📸 Отправь фото, где нужно убрать фон", reply_markup=kb_main())
-
-
-@dp.callback_query(F.data == "tariffs")
-async def cb_tariffs(c: CallbackQuery):
-    await db.touch_user(c.from_user.id)
-    await db.log_event("click_tariffs", user_id=c.from_user.id)
-
+async def send_tariffs(message: Message):
     plans = await db.list_plans()
-    lines = ["💳 Тарифы (оплата позже):\n"]
-    for p in plans:
-        if p["is_subscription"]:
-            lines.append(f"• {p['price_uah']} грн / месяц — {p['credits']} фото")
-        else:
-            lines.append(f"• {p['price_uah']} грн — {p['credits']} фото")
-    text = "\n".join(lines)
-
-    await db.log_event("tariffs_shown", user_id=c.from_user.id)
-    await c.answer()
-    await c.message.answer(text, reply_markup=kb_main())
-
-
-@dp.callback_query(F.data == "check_sub")
-async def cb_check_sub(c: CallbackQuery, bot: Bot):
-    await db.touch_user(c.from_user.id)
-    await db.log_event("check_sub", user_id=c.from_user.id)
-
-    await c.answer()
-    if await is_subscribed(bot, c.from_user.id):
-        await db.log_event("check_sub_ok", user_id=c.from_user.id)
-        await c.message.answer("✅ Подписка подтверждена. Теперь отправь фото 👇", reply_markup=kb_main())
-    else:
-        await db.log_event("check_sub_fail", user_id=c.from_user.id)
-        await c.message.answer(
-            "❌ Подписку пока не вижу. Подпишись и нажми «проверить» ещё раз.",
-            reply_markup=kb_subscribe(),
+    if not plans:
+        await message.answer(
+            "💳 Тарифы пока не настроены.\n\nСкоро добавим оплату и пакеты обработок ✅",
+            reply_markup=rk_back(is_admin(message.from_user.id)),
         )
+        return
+
+    lines = ["💳 Тарифы:\n"]
+    for p in plans:
+        # Schema from db.py: code,title,price_uah,credits,is_subscription,is_active,created_at
+        title = p.get("title", "—")
+        price = p.get("price_uah", "—")
+        credits = p.get("credits", "—")
+        lines.append(f"• {title} — {price} грн — {credits} фото")
+
+    await message.answer("\n".join(lines), reply_markup=rk_back(is_admin(message.from_user.id)))
 
 
-@dp.message(F.content_type == ContentType.PHOTO)
-async def handle_photo(m: Message, bot: Bot):
-    user_id = m.from_user.id
+async def ask_for_photo(message: Message):
+    a = is_admin(message.from_user.id)
+    await message.answer(
+        "📸 Отправь фото — я уберу фон.\n\n"
+        "✅ 1 фото бесплатно\n"
+        "🔒 2-е фото — за подписку на канал\n"
+        "💳 Дальше — тарифы",
+        reply_markup=rk_main(a),
+    )
+
+
+async def process_image(message: Message, bot: Bot, file_id: str, mime_type: str | None = None):
+    user_id = message.from_user.id
+    a = is_admin(user_id)
+
     await db.touch_user(user_id)
-    await db.log_event("photo_received", user_id=user_id)
+    await db.log_event(user_id=user_id, event="image_received", meta=mime_type or "")
 
     used = await db.get_used_this_month(user_id)
 
-    # защитный месячный лимит
-    if used >= MAX_USES_PER_MONTH:
-        await db.log_event("month_limit_reached", user_id=user_id)
-        await m.answer("🚫 Месячный лимит исчерпан. Попробуйте в следующем месяце 🙂", reply_markup=kb_main())
-        return
-
-    # лимит бесплатных генераций
-    if used >= free_limit():
-        await db.log_event("free_limit_reached", user_id=user_id)
-        await m.answer(
-            "🚫 Вы исчерпали лимит бесплатных генераций.\n\n"
-            "💳 Выберите подходящий вам тариф для продолжения.",
-            reply_markup=kb_main(),
-        )
-        # фиксируем, что тарифы “показаны как следующий шаг” (это важно для конверсии)
-        await db.log_event("tariffs_shown", user_id=user_id, meta="from_free_limit_message")
-        return
-
-    # 2-я генерация: проверка подписки
-    if used >= FREE_USES:
+    # 0 -> free
+    if used == 0:
+        pass
+    # 1 -> requires subscription
+    elif used == 1:
         if not await is_subscribed(bot, user_id):
-            await db.log_event("need_subscribe_block", user_id=user_id)
-            await m.answer(
-                "🔒 Для второй генерации нужна подписка на канал.\n"
-                "Подпишитесь и нажмите «Я подписался — проверить».",
-                reply_markup=kb_subscribe(),
+            await db.log_event(user_id=user_id, event="sub_required", meta=f"used={used}")
+            await message.answer(
+                "🔒 Второе фото доступно после подписки на канал.\n\n"
+                f"📢 Подпишись: {CHANNEL_URL}\n"
+                "После подписки нажми «✅ Я подписался».",
+                reply_markup=rk_subscribe(a),
             )
             return
+    # 2+ -> tariffs
+    else:
+        await db.log_event(user_id=user_id, event="paid_required", meta=f"used={used}")
+        await message.answer(
+            "🚫 Бесплатный лимит исчерпан.\n\n💳 Ознакомься с тарифами.",
+            reply_markup=rk_main(a),
+        )
+        return
 
-    # скачиваем фото из Telegram
-    photo = m.photo[-1]
-    tg_file = await bot.get_file(photo.file_id)
-    stream = await bot.download_file(tg_file.file_path)
-    image_bytes = stream.read()
+    await message.answer("⏳ Обрабатываю…", reply_markup=ReplyKeyboardRemove())
+    await db.log_event(user_id=user_id, event="remove_bg_start")
 
-    await m.answer("⏳ Убираю фон…", reply_markup=kb_main())
     try:
-        await process_photo(bot, m.chat.id, user_id, image_bytes)
+        tg_file = await bot.get_file(file_id)
+        stream = await bot.download_file(tg_file.file_path)
+        image_bytes = stream.read()
+
+        # PhotoRoom
+        result_bytes = await remove_bg(image_bytes=image_bytes, api_key=PHOTOROOM_API_KEY)
+
+        await db.inc_used_this_month(user_id)
+        await db.log_event(user_id=user_id, event="remove_bg_success")
+
+        await message.answer_photo(
+            photo=result_bytes,
+            caption="✅ Готово! Фон убран.\n\nЧтобы обработать ещё — отправь следующее фото.",
+            reply_markup=rk_main(a),
+        )
     except Exception as e:
-        await db.log_event("remove_bg_error", user_id=user_id, meta=str(e)[:800])
-        await m.answer(f"❌ Ошибка обработки:\n{e}", reply_markup=kb_main())
+        await db.log_event(user_id=user_id, event="remove_bg_error", meta=str(e)[:300])
+        await message.answer(
+            "⚠️ Не получилось обработать фото. Попробуй другое изображение.",
+            reply_markup=rk_main(a),
+        )
 
 
-# --------- ADMIN ---------
+# =======================
+# Admin stats (queries over events table)
+# =======================
+async def _count_events(day_from: str, day_to: str | None = None) -> dict:
+    """
+    Returns counts for key funnel events in [day_from, day_to] inclusive.
+    day_* are 'YYYY-MM-DD' (UTC).
+    """
+    # Common funnel events we log / might exist in older code
+    keys = [
+        "start",
+        "image_received",
+        "photo_received",
+        "remove_bg_start",
+        "remove_bg_success",
+        "remove_bg_error",
+        "sub_required",
+        "sub_ok",
+        "sub_fail",
+        "paid_required",
+        "check_sub_error",
+    ]
 
-@dp.message(F.text.in_({"/stats", "/admin"}))
-async def admin_entry(m: Message):
-    await db.touch_user(m.from_user.id)
-    await db.log_event("admin_cmd", user_id=m.from_user.id, meta=m.text)
+    # Use db._conn directly (aiosqlite connection created in db.connect()).
+    conn = getattr(db, "_conn", None)
+    if conn is None:
+        return {k: 0 for k in keys}
 
-    if not is_admin(m.from_user.id):
-        return  # молча игнорируем
+    if day_to is None:
+        day_to = day_from
 
-    await m.answer("🛠 Админ-панель:", reply_markup=kb_admin())
+    counts = {k: 0 for k in keys}
+    placeholders = ",".join("?" for _ in keys)
+    sql = f"""
+        SELECT event, COUNT(*) as c
+        FROM events
+        WHERE day >= ? AND day <= ?
+          AND event IN ({placeholders})
+        GROUP BY event
+    """
+    params = [day_from, day_to, *keys]
+    cur = await conn.execute(sql, params)
+    rows = await cur.fetchall()
+    for event, c in rows:
+        counts[event] = c
+    return counts
 
 
-@dp.callback_query(F.data.in_({"adm_today", "adm_7d"}))
-async def cb_admin_stats(c: CallbackQuery):
-    await c.answer()
-    if not is_admin(c.from_user.id):
-        return
+async def admin_show_today(message: Message):
+    # UTC day (same as db stores)
+    today = datetime.now(timezone.utc).date().isoformat()
+    s = await _count_events(today, today)
 
-    days = 1 if c.data == "adm_today" else 7
-    s = await db.get_stats_range(days)
+    # Prefer image_received, but keep fallback photo_received for older versions
+    received = s.get("image_received", 0) + s.get("photo_received", 0)
+    ok = s.get("remove_bg_success", 0)
+    err = s.get("remove_bg_error", 0)
+    subreq = s.get("sub_required", 0)
+    paid = s.get("paid_required", 0)
 
     text = (
-        f"📊 Статистика ({s['day_from']} → {s['day_to']}):\n\n"
-        f"👤 Пользователей всего: {s['users_total']}\n"
-        f"👥 Уникальных за период: {s['unique_users']}\n\n"
-        f"📸 Фото получено: {s['photo_received']}\n"
-        f"✅ Успешных удалений: {s['remove_ok']}\n"
-        f"🔒 Блок подписки (2-я попытка): {s['need_subscribe_block']}\n"
-        f"🚫 Уперлись в лимит: {s['free_limit_reached']}\n"
-        f"💳 Клик «Тарифы»: {s['tariffs_click']}\n"
-        f"📄 «Тарифы показаны»: {s['tariffs_shown']}\n\n"
-        f"🗓 Генераций в месяце ({s['month']}): {s['month_used_total']}\n"
-        f"🖼 Генераций всего: {s['all_used_total']}\n"
+        f"📊 Сегодня (UTC {today})\n\n"
+        f"👤 /start: {s.get('start',0)}\n"
+        f"📩 Фото получено: {received}\n"
+        f"✅ Успешно: {ok}\n"
+        f"⚠️ Ошибки: {err}\n"
+        f"🔒 Треб. подписку: {subreq}\n"
+        f"💳 Уперлись в тарифы: {paid}\n"
     )
-    await c.message.answer(text, reply_markup=kb_admin())
+    await message.answer(text, reply_markup=rk_admin())
 
 
-@dp.callback_query(F.data == "adm_funnel_7d")
-async def cb_admin_funnel(c: CallbackQuery):
-    await c.answer()
-    if not is_admin(c.from_user.id):
-        return
+async def admin_show_7d(message: Message):
+    today = datetime.now(timezone.utc).date()
+    day_to = today.isoformat()
+    day_from = (today - timedelta(days=6)).isoformat()
+    s = await _count_events(day_from, day_to)
 
-    f = await db.get_funnel_range(7)
+    received = s.get("image_received", 0) + s.get("photo_received", 0)
+    ok = s.get("remove_bg_success", 0)
+    err = s.get("remove_bg_error", 0)
+    subreq = s.get("sub_required", 0)
+    paid = s.get("paid_required", 0)
 
     text = (
-        f"🔁 Воронка (7 дней: {f['day_from']} → {f['day_to']}):\n\n"
-        f"📸 Фото получено: {f['photo_received']}\n"
-        f"🚫 Уперлись в лимит: {f['free_limit_reached']} "
-        f"({f['rate_limit_from_photo']:.1f}%)\n"
-        f"📄 Тарифы показаны: {f['tariffs_shown']} "
-        f"({f['rate_tariffs_shown_from_limit']:.1f}%)\n"
-        f"💳 Клик «Тарифы»: {f['tariffs_click']} "
-        f"({f['rate_tariffs_click_from_shown']:.1f}%)\n\n"
-        f"Идея: повышаем кликабельность «Тарифы» и понятность текста лимита."
+        f"📈 7 дней (UTC {day_from} … {day_to})\n\n"
+        f"👤 /start: {s.get('start',0)}\n"
+        f"📩 Фото получено: {received}\n"
+        f"✅ Успешно: {ok}\n"
+        f"⚠️ Ошибки: {err}\n"
+        f"🔒 Треб. подписку: {subreq}\n"
+        f"💳 Уперлись в тарифы: {paid}\n"
     )
-    await c.message.answer(text, reply_markup=kb_admin())
+    await message.answer(text, reply_markup=rk_admin())
 
 
-@dp.callback_query(F.data == "adm_plans")
-async def cb_admin_plans(c: CallbackQuery):
-    await c.answer()
-    if not is_admin(c.from_user.id):
+async def admin_show_conversion(message: Message):
+    today = datetime.now(timezone.utc).date()
+    day_to = today.isoformat()
+    day_from = (today - timedelta(days=6)).isoformat()
+    s = await _count_events(day_from, day_to)
+
+    starts = s.get("start", 0)
+    received = s.get("image_received", 0) + s.get("photo_received", 0)
+    ok = s.get("remove_bg_success", 0)
+    subreq = s.get("sub_required", 0)
+    paid = s.get("paid_required", 0)
+
+    def pct(a: int, b: int) -> str:
+        if b <= 0:
+            return "—"
+        return f"{(a / b) * 100:.1f}%"
+
+    text = (
+        f"🎯 Конверсия (UTC {day_from} … {day_to})\n\n"
+        f"/start: {starts}\n"
+        f"Фото получено: {received} (от /start: {pct(received, starts)})\n"
+        f"Успешно убрали фон: {ok} (от фото: {pct(ok, received)})\n"
+        f"Запрос подписки (2-я попытка): {subreq}\n"
+        f"Уперлись в тарифы (3+): {paid}\n"
+    )
+    await message.answer(text, reply_markup=rk_admin())
+
+
+# =======================
+# Commands / Buttons
+# =======================
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    await db.touch_user(message.from_user.id)
+    await db.log_event(user_id=message.from_user.id, event="start", meta=message.text or "")
+    await ask_for_photo(message)
+
+
+@dp.message(F.text == "🪄 Убрать фон")
+async def btn_remove_bg(message: Message):
+    await message.answer("📸 Пришли новое фото, чтобы убрать фон.", reply_markup=rk_back(is_admin(message.from_user.id)))
+
+
+@dp.message(F.text == "💳 Тарифы")
+async def btn_tariffs(message: Message):
+    await send_tariffs(message)
+
+
+@dp.message(F.text == "⬅️ Назад")
+async def btn_back(message: Message):
+    await ask_for_photo(message)
+
+
+@dp.message(F.text.in_({"/admin", "/stats", "📊 Статистика"}))
+async def btn_admin_panel(message: Message):
+    if not is_admin(message.from_user.id):
         return
-
-    plans = await db.list_plans()
-    lines = ["🧾 Таблица тарифов (без оплаты):\n"]
-    for p in plans:
-        if p["is_subscription"]:
-            lines.append(f"• {p['code']}: {p['title']} — {p['price_uah']} грн/мес, лимит {p['credits']} фото")
-        else:
-            lines.append(f"• {p['code']}: {p['title']} — {p['price_uah']} грн, {p['credits']} фото")
-    await c.message.answer("\n".join(lines), reply_markup=kb_admin())
+    await message.answer("📊 Админ-статистика:", reply_markup=rk_admin())
 
 
-# --------- lifecycle ---------
+@dp.message(F.text == "📊 Сегодня")
+async def btn_admin_today(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await admin_show_today(message)
+
+
+@dp.message(F.text == "📈 7 дней")
+async def btn_admin_7d(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await admin_show_7d(message)
+
+
+@dp.message(F.text == "🎯 Конверсия")
+async def btn_admin_conv(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await admin_show_conversion(message)
+
+
+@dp.message(F.text == "💳 Тарифы (таблица)")
+async def btn_admin_plans(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await send_tariffs(message)
+
+
+@dp.message(F.text == "✅ Я подписался")
+async def btn_check_sub(message: Message, bot: Bot):
+    user_id = message.from_user.id
+    a = is_admin(user_id)
+
+    ok = await is_subscribed(bot, user_id)
+    if ok:
+        await db.log_event(user_id=user_id, event="sub_ok")
+        await message.answer("✅ Подписка подтверждена! Теперь пришли фото.", reply_markup=rk_main(a))
+    else:
+        await db.log_event(user_id=user_id, event="sub_fail")
+        await message.answer(
+            f"❌ Подписка не найдена.\n\nПодпишись: {CHANNEL_URL}\nИ нажми «✅ Я подписался» снова.",
+            reply_markup=rk_subscribe(a),
+        )
+
+
+# PHOTO
+@dp.message(F.photo)
+async def on_photo(message: Message, bot: Bot):
+    file_id = message.photo[-1].file_id
+    await process_image(message, bot, file_id, mime_type="photo")
+
+
+# DOCUMENT image/*
+@dp.message(F.document)
+async def on_document(message: Message, bot: Bot):
+    doc = message.document
+    if not doc:
+        return
+    if not (doc.mime_type or "").startswith("image/"):
+        return
+    await process_image(message, bot, doc.file_id, mime_type=doc.mime_type)
+
 
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN not found. Проверь .env (BOT_TOKEN=...)")
     await db.connect()
     bot = Bot(token=BOT_TOKEN)
     try:
-        await dp.start_polling(bot, polling_timeout=30)
+        await dp.start_polling(bot)
     finally:
         await db.close()
 
